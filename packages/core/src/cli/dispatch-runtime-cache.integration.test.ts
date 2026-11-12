@@ -3,7 +3,18 @@ import { captureRuntimeIdentity } from '../runtime-identity'
 import { DispatchUpgradeController } from './dispatch-upgrade-controller'
 import { existsSync } from 'node:fs'
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, writeFile, readFile, rm, chmod, symlink, stat } from 'node:fs/promises'
+import {
+  mkdtemp,
+  mkdir,
+  writeFile,
+  readFile,
+  rm,
+  chmod,
+  symlink,
+  stat,
+  realpath,
+  appendFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import {
@@ -14,8 +25,10 @@ import {
   validateRuntime,
   RUNTIME_CONFIG,
   validateCoreConfigs,
+  describeRuntimeCode,
 } from './dispatch-runtime-cache'
 import {
+  codeIdentity,
   copyDependencies,
   scanDependencies,
   treeDigest,
@@ -26,6 +39,7 @@ import {
   reservePreparedRuntime,
   activateRuntime,
   pruneRuntimes,
+  readCacheMemo,
   retainRuntime,
   spawnUsingRuntime,
 } from './dispatch-runtime-use'
@@ -165,6 +179,10 @@ test('current, distinct previous, held and a live child survive pruning', async 
   const fourth = await prepareRuntime(source, checkout)
   retainRuntime(fourth.root, true)
   for (const runtime of [first, second, third, fourth]) releasePreparedRuntime(runtime.root)
+  const cache = dirname(dirname(first.root))
+  // Memos are regular files in the cache root that pruning never treats as entries.
+  await file(join(cache, 'source-fingerprints.json'), '{"version":1,"entries":[]}')
+  const index = await readFile(join(cache, 'runtime-index.json'), 'utf8')
   const use = spawnUsingRuntime(first.root, () =>
     Bun.spawn([process.execPath, '-e', 'setInterval(()=>{},1000)'], {
       stdout: 'ignore',
@@ -187,6 +205,10 @@ test('current, distinct previous, held and a live child survive pruning', async 
   }
   pruneRuntimes(dirname(dirname(first.root)))
   await expect(validateRuntime(first)).rejects.toThrow()
+  expect(await readFile(join(cache, 'runtime-index.json'), 'utf8')).toBe(index)
+  expect(await readFile(join(cache, 'source-fingerprints.json'), 'utf8')).toBe(
+    '{"version":1,"entries":[]}',
+  )
 }, 30000)
 
 test('concurrent offline preparations converge and internal asset links preserve native module identity', async () => {
@@ -564,3 +586,138 @@ test('rollback activation preserves fallback and held runtime across pruning and
   syncRollbackRetention(cache, 'operator-restart')
   expect(JSON.parse(await readFile(join(cache, 'retention.json'), 'utf8')).rollback).toBeUndefined()
 })
+
+test('the tree digest stream is pinned: existing cache entries stay valid across versions', async () => {
+  const root = await realpath(await temp())
+  await file(join(root, 'B'), 'upper')
+  await file(join(root, 'a/plain.txt'), 'plain bytes\n')
+  await file(join(root, 'a/nested/run.sh'), '#!/bin/sh\necho run\n')
+  await symlink('../B', join(root, 'a/link'))
+  await chmod(join(root, 'B'), 0o644)
+  await chmod(join(root, 'a/plain.txt'), 0o644)
+  await chmod(join(root, 'a/nested/run.sh'), 0o755)
+  for (const directory of ['a/nested', 'a', '']) await chmod(join(root, directory), 0o755)
+  // Values computed by the asynchronous walk that published existing runtimes.
+  expect(await treeDigest(root)).toBe(
+    '56a4af01066376ede52a8b6a03561f65d429f83f05cc3c9c8ac56b51ac82cdb5',
+  )
+  expect(await treeDigest(root, new Set(['nested']))).toBe(
+    'c97c64bb2f44ed52ab8b1166e2dbfce787fc328688f66292ed63f0de2da4e73d',
+  )
+})
+
+const noAssembly = {
+  mkdtemp: async (): Promise<string> => {
+    throw new Error('assembled a runtime')
+  },
+}
+const runtimeIndex = async (checkout: string) =>
+  readCacheMemo(join(await realpath(checkout), '.autobuild/runtime'), 'runtime-index.json')
+
+test('the modeled code identity equals the staged tree for links, modes, exclusions and rewritten files', async () => {
+  const { source, checkout } = await fixture()
+  const manifest = JSON.parse(await readFile(join(source, 'package.json'), 'utf8'))
+  manifest.files.push('package.json')
+  await writeFile(join(source, 'package.json'), JSON.stringify(manifest))
+  await writeFile(join(source, '.bun-tag'), `github-owner-repo-${'c'.repeat(40)}`)
+  await symlink('value.ts', join(source, 'packages/core/src/alias.ts'))
+  await symlink('core/src', join(source, 'packages/sources'))
+  await file(join(source, 'packages/core/src/tool.sh'), '#!/bin/sh\n')
+  await chmod(join(source, 'packages/core/src/tool.sh'), 0o755)
+  await file(join(source, 'packages/.env.local'), 'SECRET=1')
+  await file(join(source, 'packages/core/node_modules/stale/index.js'), 'excluded')
+  const runtime = await prepareRuntime(source, checkout)
+  const described = await describeRuntimeCode(await realpath(source))
+  expect(await codeIdentity(runtime.root, new Set(['node_modules']))).toBe(described)
+  expect((await prepareRuntime(source, checkout, undefined, undefined, noAssembly)).id).toBe(
+    runtime.id,
+  )
+}, 30000)
+
+test('a cached runtime is verified and reused without assembly, and only for identical inputs', async () => {
+  const { source, checkout } = await fixture()
+  const first = await prepareRuntime(source, checkout)
+  const layer = join(checkout, '.autobuild/runtime/layers', first.dependencies)
+  await rm(layer, { recursive: true })
+  const hit = await prepareRuntime(source, checkout, undefined, undefined, noAssembly)
+  expect(hit.id).toBe(first.id)
+  expect(existsSync(layer)).toBe(false)
+  expect((await runtimeIndex(checkout)).map((entry) => entry.value)).toEqual([first.id])
+  await file(join(source, 'packages/core/src/value.ts'), 'export const value = 43')
+  await expect(prepareRuntime(source, checkout, undefined, undefined, noAssembly)).rejects.toThrow(
+    'assembled a runtime',
+  )
+  await file(join(source, 'packages/core/src/value.ts'), 'export const value = 42')
+  const dependency = join(source, 'node_modules/example/index.js')
+  await appendFile(dependency, '\n// changed dependency bytes')
+  const changed = await prepareRuntime(source, checkout)
+  expect(changed.id).not.toBe(first.id)
+  expect(changed.dependencies).not.toBe(first.dependencies)
+  await file(dependency, 'exports.value = 42')
+  expect((await prepareRuntime(source, checkout, undefined, undefined, noAssembly)).id).toBe(
+    first.id,
+  )
+}, 30000)
+
+test('a stale index entry is never selected and heals itself', async () => {
+  const { source, checkout } = await fixture()
+  const a = await prepareRuntime(source, checkout)
+  await file(join(source, 'packages/core/src/value.ts'), 'export const value = 43')
+  const b = await prepareRuntime(source, checkout)
+  await file(join(source, 'packages/core/src/value.ts'), 'export const value = 42')
+  const index = join(checkout, '.autobuild/runtime/runtime-index.json')
+  const entries = JSON.parse(await readFile(index, 'utf8'))
+  for (const entry of entries.entries) if (entry.value === a.id) entry.value = b.id
+  await writeFile(index, JSON.stringify(entries))
+  expect((await prepareRuntime(source, checkout)).id).toBe(a.id)
+  expect((await runtimeIndex(checkout)).filter((entry) => entry.value === a.id)).toHaveLength(1)
+  expect((await prepareRuntime(source, checkout, undefined, undefined, noAssembly)).id).toBe(a.id)
+}, 30000)
+
+test('a corrupt cached runtime or archive is refused on a hit and reused once restored', async () => {
+  const { source, checkout } = await fixture()
+  const runtime = await prepareRuntime(source, checkout)
+  for (const path of ['packages/core/src/value.ts', 'node_modules/example/index.js']) {
+    const cached = join(runtime.root, path)
+    const bytes = await readFile(cached)
+    await appendFile(cached, ' ')
+    await expect(prepareRuntime(source, checkout)).rejects.toThrow('corrupt completed runtime')
+    await writeFile(cached, bytes)
+    expect((await prepareRuntime(source, checkout, undefined, undefined, noAssembly)).id).toBe(
+      runtime.id,
+    )
+  }
+  await writeFile(join(dirname(runtime.root), 'distribution.tgz'), 'corrupt')
+  await expect(prepareRuntime(source, checkout)).rejects.toThrow('corrupt runtime archive')
+}, 30000)
+
+test('source or dependency changes while preparing fail the launch, on a hit and on a miss', async () => {
+  const { source, checkout } = await fixture()
+  // The import probe runs bin/ab.ts in the checkout, so it can edit the source mid-preparation.
+  await file(
+    join(source, 'bin/ab.ts'),
+    `import {value} from 'example'; import {appendFileSync, existsSync, readFileSync} from 'node:fs'
+if (existsSync('mutate')) appendFileSync(readFileSync('mutate', 'utf8'), '\\n// changed')
+console.log(value)`,
+  )
+  await prepareRuntime(source, checkout)
+  const code = join(source, 'packages/core/src/value.ts')
+  const dependency = join(source, 'node_modules/example/index.js')
+  const sourceChanged = 'Autobuild source changed while preparing runtime; retry dispatch'
+  const dependenciesChanged =
+    'installed dependencies changed while preparing runtime; retry dispatch'
+  for (const miss of [false, true]) {
+    for (const [path, error] of [
+      [code, sourceChanged],
+      [dependency, dependenciesChanged],
+    ] as const) {
+      await file(code, miss ? 'export const value = 43' : 'export const value = 42')
+      await file(dependency, 'exports.value = 42')
+      await file(join(checkout, 'mutate'), path)
+      const options = miss ? {} : noAssembly
+      await expect(prepareRuntime(source, checkout, undefined, undefined, options)).rejects.toThrow(
+        error,
+      )
+    }
+  }
+}, 60000)

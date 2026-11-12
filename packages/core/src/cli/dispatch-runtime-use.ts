@@ -295,6 +295,49 @@ export function releasePreparedRuntime(root: string, owner = process.pid): void 
     })
 }
 
+/** A bounded, most-recently-used-first list of `key → value` lookups kept as a
+ * regular file in the cache root. Memos are hints: every reader verifies what a
+ * value names before relying on it, and pruning never treats them as entries. */
+export interface CacheMemoEntry {
+  key: string
+  value: string
+}
+export function withMemoEntry(
+  entries: CacheMemoEntry[],
+  entry: CacheMemoEntry,
+  limit: number,
+): CacheMemoEntry[] {
+  return [entry, ...entries.filter(({ key }) => key !== entry.key)].slice(0, limit)
+}
+export function readCacheMemo(cache: string, name: string): CacheMemoEntry[] {
+  let memo: { version?: unknown; entries?: unknown }
+  try {
+    memo = JSON.parse(readFileSync(join(cache, name), 'utf8'))
+  } catch {
+    return []
+  }
+  if (memo?.version !== 1 || !Array.isArray(memo.entries)) return []
+  return memo.entries.filter(
+    (entry): entry is CacheMemoEntry =>
+      typeof entry?.key === 'string' &&
+      /^[a-f0-9]{64}$/.test(entry.key) &&
+      typeof entry.value === 'string',
+  )
+}
+export function recordCacheMemo(
+  cache: string,
+  name: string,
+  entry: CacheMemoEntry,
+  limit: number,
+): void {
+  locked(cache, () => {
+    const entries = withMemoEntry(readCacheMemo(cache, name), entry, limit)
+    const temporary = join(cache, `.memo-${randomUUID()}`)
+    writeFileSync(temporary, JSON.stringify({ version: 1, entries }))
+    renameSync(temporary, join(cache, name))
+  })
+}
+
 /** Synchronous, short filesystem mutations only; shared with spawn and prune. */
 export function mutateRuntimeCache<T>(cache: string, operation: () => T): T {
   return locked(cache, operation)
