@@ -15,7 +15,7 @@ capacity = 2
 #   table), driven by a dispatcher on the maintainer's machine. The worktree
 #   host must provide Bun, Git, the `claude` CLI, Google Chrome, and a
 #   PostgreSQL on 127.0.0.1:5432 with a postgres/postgres login.
-# - State lives in this fork's own hosted service on Vercel ([store] below).
+# - State lives locally in the main checkout's .autobuild/ (no [store] table).
 # - Tickets are this fork's GitHub issues ([tickets] below).
 # - Every agent bills the maintainer's own Claude subscription.
 # Upstream runs builds in Vercel Sandbox under its own account; keep this file
@@ -179,8 +179,3 @@ proposalState = "triage"        # harvest proposals wait for a human to groom th
                                 # each proposal build's observations filed more proposals.
 backlogState = "icebox"         # deferred on purpose; `--role backlog` moves here
 rejectedState = "rejected"      # considered and declined; `--role rejected` moves here
-
-# This fork's own hosted service: Vercel project yosef-d7ab/yosef-autobuild,
-# deployed from this fork's main (store only, no dispatcher cron).
-[store]
-url = "https://yosef-autobuild.vercel.app"

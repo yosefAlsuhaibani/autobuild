@@ -34,7 +34,7 @@ test('fork builds in local worktrees on subscription-billed Claude Code', async 
   await access(join(REPO_ROOT, 'scripts/postgres-live.sh'), constants.X_OK)
 })
 
-test('the fork keeps this repository pipeline on its own GitHub issues and store', async () => {
+test('the fork keeps this repository pipeline on its own GitHub issues and a local store', async () => {
   const config = await loadConfig(join(REPO_ROOT, 'autobuild.toml'))
 
   expect(config.commands).toMatchObject({
@@ -112,7 +112,7 @@ test('the fork keeps this repository pipeline on its own GitHub issues and store
     triageState: 'triage',
     proposalState: 'triage',
   })
-  expect(config.store).toEqual({ url: 'https://yosef-autobuild.vercel.app' })
+  expect(config.store).toBeUndefined()
 })
 
 test('the ui-website step covers site source, design references and evidence tooling', async () => {
