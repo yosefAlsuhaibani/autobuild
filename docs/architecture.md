@@ -474,7 +474,10 @@ dependencies offline under `.autobuild/runtime/`, then starts
 only filesystem/process helpers and never opens a Store. The generation's
 frontend, kernel, local runners and agent CLI use one completed immutable root;
 `dispatch-runtime-use.ts` protects current/previous/held/live entries during
-spawn and pruning. Source guest archives are captured at installation. Source generations deliver
+spawn and pruning. `dispatch-runtime-cache.ts` models the code tree it would
+stage, and `runtime-index.json` maps that identity and the dependency fingerprint
+to a completed entry, which a launch re-verifies and reuses without assembling
+a new tree. Source guest archives are captured at installation. Source generations deliver
 the exact packed source archive; registry generations keep a separate,
 digest-validated GitHub release asset matching the cached manifest version,
 resolved and atomically cached at first guest use. Local launch remains offline.
@@ -489,7 +492,9 @@ base snapshot, or rereads the original install pathname when unpinned. Frozen
 launcher eligibility selects source mode for a source root sharing the dispatched
 repository's Git common directory. `dispatch-upgrade-source.ts` exports exact
 commits into private cache staging and fingerprints actual packed contents and
-the production-reachable Bun lock closure. Source preparation installs with the
+the production-reachable Bun lock closure. Launches remember packed fingerprints
+in `source-fingerprints.json`, keyed by exact packaged input bytes and the
+packaging toolchain. Source preparation installs with the
 frozen lock and scripts disabled, then publishes through the existing immutable
 runtime cache. Neither resolution nor installation changes an operator/build
 worktree. Excluded-file commits change observed provenance without adoption.

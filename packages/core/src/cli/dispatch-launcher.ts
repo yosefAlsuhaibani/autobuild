@@ -89,10 +89,12 @@ export async function launchDispatcher(argv: string[]): Promise<number> {
         ? dirname(dirname(entry))
         : distributionRoot()
   const repository = await sourceRepository(distributionRoot(), checkout)
+  // Both fingerprints may reuse a packaged fingerprint remembered for identical inputs.
+  const memo = join(checkout, '.autobuild', 'runtime')
   let sourceLaunch: SourceLaunch | undefined
   if (repository) {
     const commit = (await sourceCommand(['git', 'rev-parse', 'HEAD'], distributionRoot())).trim()
-    const baseline = await sourceContent(distributionRoot(), repository)
+    const baseline = await sourceContent(distributionRoot(), repository, undefined, memo)
     sourceLaunch = { repository, commit, baseline: baseline.key }
   }
   let runtime = await prepareLaunchRuntime(distributionRoot(), originalInstall, checkout)
@@ -109,7 +111,8 @@ export async function launchDispatcher(argv: string[]): Promise<number> {
   }
   if (
     sourceLaunch &&
-    (await sourceContent(distributionRoot(), sourceLaunch.repository)).key !== sourceLaunch.baseline
+    (await sourceContent(distributionRoot(), sourceLaunch.repository, undefined, memo)).key !==
+      sourceLaunch.baseline
   ) {
     releasePreparedRuntime(runtime.root)
     throw new Error('source changed while freezing launch provenance; retry dispatch')
