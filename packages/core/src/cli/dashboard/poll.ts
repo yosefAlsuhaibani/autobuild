@@ -36,9 +36,12 @@ import {
  * row's session history with authoritative stream ids and statuses (SPEC §9).
  * `getArtifact` is optional: when present, the effective-config artifact's
  * metadata decorates each row with its pinned pipeline source and revision
- * (SPEC §16.1). */
+ * (SPEC §16.1). `getRepoBuildDigests` is optional: when present, a fresh
+ * cache's first refresh classifies completed builds from this one
+ * repository-scoped read instead of reading each one. */
 export interface DashboardBuildReader {
   getReducerValue?: BuildStore['getReducerValue']
+  getRepoBuildDigests?: BuildStore['getRepoBuildDigests']
   listBuildsForRepo(repo: string): Promise<BuildRecord[]>
   getEvents(slug: string, sinceSeq?: number): Promise<AbEvent[]>
   listStreams?(scope: StreamScope): Promise<StreamRecord[]>
@@ -118,15 +121,34 @@ function validateDelta(slug: string, sinceSeq: number, events: AbEvent[]): void 
 }
 
 /**
+ * Await every read, then fail with the first rejection in argument order. No
+ * read a failed refresh issued outlives it into the next serialized refresh.
+ */
+async function settleAll<T extends readonly unknown[] | []>(
+  reads: T,
+): Promise<{ -readonly [K in keyof T]: Awaited<T[K]> }> {
+  const settled = await Promise.allSettled(reads)
+  const values: unknown[] = []
+  for (const result of settled) {
+    if (result.status === 'rejected') throw result.reason
+    values.push(result.value)
+  }
+  return values as { -readonly [K in keyof T]: Awaited<T[K]> }
+}
+
+/**
  * Process-local, display-only acceleration for the interactive dispatch frame.
  *
- * Every refresh still discovers records with `listBuildsForRepo(repo)`. A first-seen
+ * Every refresh still discovers records with `listBuildsForRepo(repo)`. A fresh
+ * cache's first refresh also reads the repository's build digests once and
+ * tombstones builds whose digest is done without reading them, so a new process
+ * reads per-build values only for builds that are not done. A first-seen
  * stream uses persisted build facts when available, with no event reads; local
  * readers without reduced values hydrate from seq 0, then read only after their
- * reduced `lastSeq`. Empty deltas preserve the exact reduction and
- * projected row, so phase timing is not recomputed. Only fully completed
- * streams compact to tombstones; acknowledged aborts remain live through their
- * cleanup checkpoints and final completion.
+ * reduced `lastSeq`. Per-build reads are issued concurrently. Empty deltas
+ * preserve the exact reduction and projected row, so phase timing is not
+ * recomputed. Only fully completed streams compact to tombstones; acknowledged
+ * aborts remain live through their cleanup checkpoints and final completion.
  *
  * Refreshes are serialized and committed transactionally. A failed refresh
  * leaves every entry at its last successful sequence, while concurrent callers
@@ -156,6 +178,22 @@ export class DashboardBuildPollCache {
     } catch {
       return undefined
     }
+  }
+
+  /** Slugs whose build digest proves the build done, when the reader exposes
+   * the repository digest batch. The digest's `terminal` is the same in-order
+   * overwrite of `build.completed`/`build.aborted` as the build reducer's
+   * status (store/digest.ts), so `'done'` holds exactly when the reduced
+   * status is `done`. `'aborted'` is excluded: like `isTerminal`, the cache
+   * keeps an aborted build live through its cleanup saga. */
+  private async completedBuilds(): Promise<ReadonlySet<string> | undefined> {
+    const read = this.reader.getRepoBuildDigests
+    if (read === undefined) return undefined
+    const completed = new Set<string>()
+    for (const [slug, digest] of await read.call(this.reader, this.repo)) {
+      if (digest.terminal === 'done') completed.add(slug)
+    }
+    return completed
   }
 
   /** True only while no later refresh has committed. */
@@ -247,25 +285,28 @@ export class DashboardBuildPollCache {
     fullEnrichment: boolean,
   ): Promise<DashboardPollSnapshot> {
     const configChanged = configRevision !== this.configRevision || config !== this.config
-    const records = await this.reader.listBuildsForRepo(this.repo)
-    const next = new Map<string, PollEntry>()
+    const [records, completed] = await settleAll([
+      this.reader.listBuildsForRepo(this.repo),
+      this.committedRevision === 0 ? this.completedBuilds() : undefined,
+    ])
 
-    for (const record of records) {
-      const current = this.entries.get(record.slug)
-      if (current?.kind === 'terminal') {
-        next.set(record.slug, { ...current, record })
-        continue
-      }
+    const entries = await settleAll(
+      records.map(async (record): Promise<PollEntry> => {
+        const current = this.entries.get(record.slug)
+        if (current?.kind === 'terminal') return { ...current, record }
+        // Only a done digest skips the read. A record listed without a digest
+        // entry, or whose digest is not done, falls through to the build's own
+        // authoritative facts, exactly as before.
+        if (current === undefined && completed?.has(record.slug))
+          return { kind: 'terminal', record }
 
-      if (this.reader.getReducerValue !== undefined) {
-        const { cursor, value } = await readBuildFacts(
-          { getReducerValue: this.reader.getReducerValue.bind(this.reader) },
-          record.slug,
-        )
-        if (isTerminal(value.state)) {
-          next.set(record.slug, { kind: 'terminal', record })
-        } else {
-          next.set(record.slug, {
+        if (this.reader.getReducerValue !== undefined) {
+          const { cursor, value } = await readBuildFacts(
+            { getReducerValue: this.reader.getReducerValue.bind(this.reader) },
+            record.slug,
+          )
+          if (isTerminal(value.state)) return { kind: 'terminal', record }
+          return {
             kind: 'reduced',
             cursor,
             record,
@@ -281,60 +322,56 @@ export class DashboardBuildPollCache {
               current.build?.ticketId === record.ticket?.id
                 ? current.build
                 : await this.projectRow(record, value.state, [], config, value),
-          })
+          }
         }
-        continue
-      }
-      if (current?.kind === 'reduced') throw new Error('dashboard reader lost reduced values')
+        if (current?.kind === 'reduced') throw new Error('dashboard reader lost reduced values')
 
-      const sinceSeq = current?.state.lastSeq ?? 0
-      const delta = await this.reader.getEvents(record.slug, sinceSeq)
-      validateDelta(record.slug, sinceSeq, delta)
+        const sinceSeq = current?.state.lastSeq ?? 0
+        const delta = await this.reader.getEvents(record.slug, sinceSeq)
+        validateDelta(record.slug, sinceSeq, delta)
 
-      if (current !== undefined && delta.length === 0) {
-        // Preserve the reduction on empty deltas. Bounded full refreshes also
-        // reload mutable record, stream and artifact enrichment.
-        next.set(
-          record.slug,
-          fullEnrichment || configChanged || current.build?.ticketId !== record.ticket?.id
+        if (current !== undefined && delta.length === 0) {
+          // Preserve the reduction on empty deltas. Bounded full refreshes also
+          // reload mutable record, stream and artifact enrichment.
+          return fullEnrichment || configChanged || current.build?.ticketId !== record.ticket?.id
             ? {
                 ...current,
                 record,
                 build: await this.projectRow(record, current.state, current.events, config),
               }
-            : { ...current, record },
-        )
-        continue
-      }
+            : { ...current, record }
+        }
 
-      const events = current === undefined ? delta : [...current.events, ...delta]
-      const acc = buildReducer.advance(current?.acc ?? buildReducer.initial(), delta)
-      const state = buildReducer.finish(acc)
-      if (isTerminal(state)) {
-        next.set(record.slug, { kind: 'terminal', record })
-        continue
-      }
-      next.set(record.slug, {
-        kind: 'live',
-        record,
-        workspace: openBuildWorkspaceReducer.advance(
-          current?.workspace ?? openBuildWorkspaceReducer.initial(),
-          delta,
-        ),
-        provisionMarker: provisionMarkerReducer.advance(
-          current?.provisionMarker ?? provisionMarkerReducer.initial(),
-          delta,
-        ),
-        events,
-        acc,
-        state,
-        restack: leafRestackReducer.advance(
-          current?.restack ?? leafRestackReducer.initial(),
-          delta,
-        ),
-        build: await this.projectRow(record, state, events, config),
-      })
-    }
+        const events = current === undefined ? delta : [...current.events, ...delta]
+        const acc = buildReducer.advance(current?.acc ?? buildReducer.initial(), delta)
+        const state = buildReducer.finish(acc)
+        if (isTerminal(state)) return { kind: 'terminal', record }
+        return {
+          kind: 'live',
+          record,
+          workspace: openBuildWorkspaceReducer.advance(
+            current?.workspace ?? openBuildWorkspaceReducer.initial(),
+            delta,
+          ),
+          provisionMarker: provisionMarkerReducer.advance(
+            current?.provisionMarker ?? provisionMarkerReducer.initial(),
+            delta,
+          ),
+          events,
+          acc,
+          state,
+          restack: leafRestackReducer.advance(
+            current?.restack ?? leafRestackReducer.initial(),
+            delta,
+          ),
+          build: await this.projectRow(record, state, events, config),
+        }
+      }),
+    )
+    // Fill in listing order: the snapshot's row, state and capacity order
+    // follows insertion order, and a repeated slug keeps its last record.
+    const next = new Map<string, PollEntry>()
+    for (const [index, record] of records.entries()) next.set(record.slug, entries[index]!)
 
     // Constructing `next` only from the latest listing also prunes records that
     // disappeared. Publish once, after every read/reduction succeeded.
