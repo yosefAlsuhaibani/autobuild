@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { readFileSync, realpathSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import {
   mkdir,
@@ -14,7 +15,15 @@ import {
 import { join, resolve } from 'node:path'
 import { packageDistribution } from '../distribution-packaging'
 import { parse as parseToml } from 'smol-toml'
-import { treeDigest, inside, type Manifest } from './dispatch-runtime-dependencies'
+import {
+  codeEntries,
+  codeIdentityDigest,
+  treeDigest,
+  inside,
+  type CodeEntry,
+  type Manifest,
+} from './dispatch-runtime-dependencies'
+import { readCacheMemo, recordCacheMemo } from './dispatch-runtime-use'
 import type { Exec } from '../ports/workspace/git-worktree'
 
 export interface SourceLaunch {
@@ -229,11 +238,14 @@ export function productionLockClosure(
   return { records, graph: canonical({ roots, packages: nodes }) }
 }
 
-/** Identity follows real pack rules, with provenance and transport timestamps removed. */
+/** Identity follows real pack rules, with provenance and transport timestamps removed.
+ * `memo` names a runtime cache whose remembered fingerprints may stand in for
+ * repacking byte-identical packaged inputs; the key is the same either way. */
 export async function sourceContent(
   root: string,
   repository: string,
   signal?: AbortSignal,
+  memo?: string,
 ): Promise<{ key: string; version: string }> {
   signal?.throwIfAborted()
   const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')) as Manifest
@@ -263,9 +275,9 @@ export async function sourceContent(
     if (Array.isArray(value)) continue
     const record = object(value).record as string[]
     const path = record[0]!.slice(record[0]!.indexOf('@workspace:') + 11)
-    workspaceContent[path] = await packagedFingerprint(join(root, path), signal)
+    workspaceContent[path] = await packagedFingerprint(join(root, path), signal, memo)
   }
-  const packaged = await packagedFingerprint(root, signal)
+  const packaged = await packagedFingerprint(root, signal, memo)
   // The frozen lock is the authority for registry resolution/integrity.
   const key = sourceHash([
     'source',
@@ -279,11 +291,91 @@ export async function sourceContent(
   return { key, version: String(manifest.version) }
 }
 
-async function packagedFingerprint(root: string, signal?: AbortSignal): Promise<string> {
+const SOURCE_FINGERPRINTS = 'source-fingerprints.json'
+const SOURCE_FINGERPRINTS_LIMIT = 16
+let packager: string | undefined | null = null
+/** The modules that define what a packaged fingerprint means, read once. */
+function packagerIdentity(): string | undefined {
+  if (packager !== null) return packager
+  try {
+    const hash = createHash('sha256')
+    for (const module of [
+      'dispatch-upgrade-source.ts',
+      'dispatch-runtime-dependencies.ts',
+      '../distribution-packaging.ts',
+    ])
+      hash.update(readFileSync(join(import.meta.dir, module)))
+    packager = hash.digest('hex')
+  } catch {
+    packager = undefined
+  }
+  return packager
+}
+function executableIdentity(name: string): [string, number, number] | undefined {
+  const found = Bun.which(name)
+  if (!found) return undefined
+  const path = realpathSync(found)
+  const stat = statSync(path)
+  return [path, stat.size, stat.mtimeMs]
+}
+/** Everything that decides a packaged fingerprint: the exact bytes, names and
+ * executable bits pack can select, and the code and tools that pack them.
+ * Undefined, which disables the memo, for anything a plain walk cannot vouch for. */
+async function packagedInput(root: string, manifest: Manifest): Promise<string | undefined> {
+  try {
+    const tools = [executableIdentity('bun'), executableIdentity('tar')]
+    const modules = packagerIdentity()
+    if (!modules || tools.some((tool) => !tool)) return undefined
+    const entries = new Map<string, CodeEntry>()
+    for (const path of [
+      'package.json',
+      ...(manifest.files ?? []).filter((p) => !p.startsWith('!')),
+    ])
+      for (const entry of await codeEntries(root, path)) {
+        if (entry.kind === 'link') return undefined
+        entries.set(entry.path, entry)
+      }
+    return sourceHash([
+      'autobuild-packaged-input-v1',
+      modules,
+      tools,
+      Bun.revision,
+      process.umask(),
+      process.platform,
+      codeIdentityDigest(entries.values()),
+    ])
+  } catch {
+    return undefined
+  }
+}
+
+async function packagedFingerprint(
+  root: string,
+  signal?: AbortSignal,
+  memo?: string,
+): Promise<string> {
   const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')) as Manifest
   for (const path of manifest.files ?? [])
     if (!path.startsWith('!') && !inside(root, resolve(root, path)))
       throw new Error('unsafe packaged source path')
+  const input = memo ? await packagedInput(root, manifest) : undefined
+  if (memo && input) {
+    const value = readCacheMemo(memo, SOURCE_FINGERPRINTS).find(({ key }) => key === input)?.value
+    if (value && /^[a-f0-9]{64}$/.test(value)) return value
+  }
+  const fingerprint = await packFingerprint(root, signal)
+  // Only a value whose inputs held still across packing is remembered.
+  if (memo && input && (await packagedInput(root, manifest)) === input)
+    recordCacheMemo(
+      memo,
+      SOURCE_FINGERPRINTS,
+      { key: input, value: fingerprint },
+      SOURCE_FINGERPRINTS_LIMIT,
+    )
+  return fingerprint
+}
+
+async function packFingerprint(root: string, signal?: AbortSignal): Promise<string> {
   // Launch baselines also package the live checkout and its workspaces. Scratch
   // must never require write access beside either source root.
   const stage = await mkdtemp(join(tmpdir(), 'autobuild-source-fingerprint-'))
