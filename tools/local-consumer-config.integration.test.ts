@@ -10,65 +10,31 @@ import { evaluateVerifyApplicability } from '../packages/core/src/kernel/verify-
 
 const REPO_ROOT = join(import.meta.dir, '..')
 
-const CODEX = { runtime: 'codex', model: 'gpt-6.1-sol', account: 'chatgpt' }
 const CLAUDE = { runtime: 'claude', model: 'claude-opus-5-5', account: 'claude' }
+const CLAUDE_FALLBACK = { runtime: 'claude', model: 'claude-sonnet-5-5', account: 'claude' }
 
-test('repository builds in Vercel Sandbox on subscription-billed Claude Code and Codex', async () => {
+// Fork configuration (yosefAlsuhaibani/autobuild): builds run in local git
+// worktrees on the maintainer's machine, billed to one Claude subscription.
+test('fork builds in local worktrees on subscription-billed Claude Code', async () => {
   const config = await loadConfig(join(REPO_ROOT, 'autobuild.toml'))
 
-  expect(config.workspace.provider).toBe('vercel-sandbox')
-  const sandbox = config.workspace.config as {
-    provisioning: { name: string }[]
-    runtimeProvisioning: Record<string, { install: string; preflight: string }>
-    environmentVariables?: string[]
-  }
-  expect(sandbox.provisioning.map((step) => step.name)).toEqual([
-    'system-install',
-    'browser-smoke',
-    'postgres',
-    'git-identity',
-  ])
-  // Each runtime is pinned, and its preflight checks that exact version.
-  for (const [runtime, pin] of [
-    ['claude', '@anthropic-ai/claude-code@'],
-    ['codex', '@openai/codex@'],
-  ] as const) {
-    const provisioning = sandbox.runtimeProvisioning[runtime]!
-    const version = provisioning.install.split(pin)[1] ?? ''
-    expect(version).toMatch(/^\d+\.\d+\.\d+$/)
-    expect(provisioning.preflight).toContain(version)
-  }
-  // Accounts carry the credentials; nothing is forwarded into the guest.
-  expect(sandbox.environmentVariables ?? []).toEqual([])
+  expect(config.workspace.provider).toBe('git-worktree')
   expect(config.accounts).toEqual({
     claude: { kind: 'claude-subscription', credentialEnv: 'CLAUDE_CODE_OAUTH_TOKEN' },
-    chatgpt: { kind: 'chatgpt-subscription', credentialEnv: 'CHATGPT_ACCESS_TOKEN' },
   })
 
-  // Producers run on Claude and reviewers on Codex, each falling back to the
-  // other provider. Every route bills a named subscription account: no Pi,
-  // no gateway-qualified model id.
-  const expected: Record<string, typeof CODEX> = {
-    default: CODEX,
-    plan: CLAUDE,
-    implement: CLAUDE,
-    'plan-review': CODEX,
-    'code-review': CODEX,
-  }
-  expect(Object.keys(config.roles).sort()).toEqual(Object.keys(expected).sort())
-  for (const [key, primary] of Object.entries(expected)) {
-    const role = config.roles[key]!
-    expect(role).toMatchObject(primary)
-    const fallback = primary === CODEX ? CLAUDE : CODEX
-    expect(role.alternates).toEqual([fallback])
-  }
+  // Every role inherits the default: Claude Opus, falling back to Sonnet on
+  // the same subscription account.
+  expect(Object.keys(config.roles)).toEqual(['default'])
+  expect(config.roles.default).toMatchObject(CLAUDE)
+  expect(config.roles.default!.alternates).toEqual([CLAUDE_FALLBACK])
 
   const runtimes = effectiveRuntimeReferences(config).map(({ runtime }) => runtime)
-  expect(runtimes.sort()).toEqual(['claude', 'codex'])
+  expect([...new Set(runtimes)]).toEqual(['claude'])
   await access(join(REPO_ROOT, 'scripts/postgres-live.sh'), constants.X_OK)
 })
 
-test('remote rollout preserves this repository pipeline on the hosted ticket tracker', async () => {
+test('the fork keeps this repository pipeline on its own GitHub issues and store', async () => {
   const config = await loadConfig(join(REPO_ROOT, 'autobuild.toml'))
 
   expect(config.commands).toMatchObject({
@@ -140,15 +106,13 @@ test('remote rollout preserves this repository pipeline on the hosted ticket tra
     skill: 'finalize-changelog',
   })
   expect(config.tickets).toMatchObject({
-    source: 'hosted',
-    url: 'https://app.autobuild.run',
-    teamKey: 'AUT',
+    source: 'github',
     readyState: 'ready',
-    createState: 'ready',
+    createState: 'triage',
     triageState: 'triage',
     proposalState: 'triage',
   })
-  expect(config.store).toEqual({ url: 'https://app.autobuild.run' })
+  expect(config.store).toEqual({ url: 'https://yosef-autobuild.vercel.app' })
 })
 
 test('the ui-website step covers site source, design references and evidence tooling', async () => {

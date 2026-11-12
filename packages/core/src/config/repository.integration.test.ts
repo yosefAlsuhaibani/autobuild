@@ -5,7 +5,8 @@ import { loadConfig } from './load'
 test('repository installs mandatory lint and the path-scoped dashboard verifiers', async () => {
   const config = await loadConfig(join(import.meta.dir, '..', '..', '..', '..', 'autobuild.toml'))
   expect(config.baseBranch).toBe('main')
-  expect(config.capacity).toBe(5)
+  // Fork configuration: builds share one machine and one Claude subscription.
+  expect(config.capacity).toBe(2)
   expect(config.policy.harvestThreshold).toBe(5)
   // Upgrade compatibility: the repository config intentionally omits this new field.
   expect(config.policy.harvestMaxDrift).toBe(3)

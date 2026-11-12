@@ -5,61 +5,27 @@
 
 # Root scalars, which TOML requires before the first table.
 baseBranch = "main"
-capacity = 5             # concurrent builds
+# Concurrent builds. Each one runs the full verify suite on this machine and
+# shares one Claude subscription, so keep this low.
+capacity = 2
 
-# Builds run remotely, dogfooding the hosted service since 2026-10-27. The
-# kernel is the hosted dispatcher (Vercel Cron on the same Vercel project as
-# app.autobuild.run). Each build executes in a disposable Vercel Sandbox, where
-# Claude Code and Codex bill against the maintainer's personal subscriptions
-# through the [accounts] below. The guest holds only placeholders; the host
-# egress policy injects the real credentials from write-only project secrets.
-[workspace]
-provider = "vercel-sandbox"
+# FORK CONFIGURATION (yosefAlsuhaibani/autobuild). Nothing here touches the
+# upstream project's infrastructure:
+# - Builds run as local git worktrees (the default provider; no [workspace]
+#   table), driven by a dispatcher on the maintainer's machine. The worktree
+#   host must provide Bun, Git, the `claude` CLI, Google Chrome, and a
+#   PostgreSQL on 127.0.0.1:5432 with a postgres/postgres login.
+# - State lives in this fork's own hosted service on Vercel ([store] below).
+# - Tickets are this fork's GitHub issues ([tickets] below).
+# - Every agent bills the maintainer's own Claude subscription.
+# Upstream runs builds in Vercel Sandbox under its own account; keep this file
+# out of any change proposed upstream.
 
-[workspace.config]
-image = "vercel/sandbox/universal:latest"
-vcpus = 4
-# One execution spans every phase up to a park point, and a single agent turn may
-# use the full policy session budget, so the guest lifetime must cover several
-# turns. At 2700 s implement sessions were cut off mid-turn (2026-09-10).
-timeoutSeconds = 14400
-operationTimeoutMs = 30000
-# The universal image is Ubuntu, where the apt `chromium` package is a snap
-# stub that installs no browser; Google's own .deb provides a real binary.
-provisioning = [
-  { name = "system-install", command = """export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/google-chrome.deb
-apt-get install -y -qq /tmp/google-chrome.deb fonts-noto-cjk fonts-noto-color-emoji fontconfig""" },
-  { name = "browser-smoke", command = "CHROMIUM_BIN=/usr/bin/google-chrome-stable BUN_BIN=/opt/autobuild-runtime/node_modules/.bin/bun ./scripts/browser-smoke.sh" },
-  { name = "postgres", command = "./scripts/postgres-live.sh install" },
-  # Finalize steps (and any in-guest git usage) need an attributable identity.
-  # System scope applies to every user, including unprivileged agent sessions,
-  # and survives a workspace re-clone (which wipes .git/config).
-  { name = "git-identity", command = "git config --system user.name 'autobuild[bot]' && git config --system user.email 'autobuild[bot]@users.noreply.github.com'" },
-]
-
-# Every primary and alternate runtime needs a pinned install and an exact
-# version preflight. Keep these on the versions the maintainer runs locally.
-[workspace.config.runtimeProvisioning.claude]
-install = "npm install --global @anthropic-ai/claude-code@2.1.311"
-preflight = "test \"$(claude --version)\" = \"2.1.311 (Claude Code)\""
-
-[workspace.config.runtimeProvisioning.codex]
-install = "npm install --global @openai/codex@0.164.0"
-preflight = "test \"$(codex --version)\" = \"codex-cli 0.164.0\""
-
-# Personal subscriptions. Values are write-only project secrets on
-# app.autobuild.run: CLAUDE_CODE_OAUTH_TOKEN via `ab secrets set` (from
-# `claude setup-token`), and the ChatGPT slot via
-# `ab accounts login chatgpt --project`, which the hosted secret refreshes.
+# The maintainer's own Claude subscription. The local dispatcher reads
+# CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) from the ignored .env.
 [accounts.claude]
 kind = "claude-subscription"
 credentialEnv = "CLAUDE_CODE_OAUTH_TOKEN"
-
-[accounts.chatgpt]
-kind = "chatgpt-subscription"
-credentialEnv = "CHATGPT_ACCESS_TOKEN"
 
 # Named commands the kernel may run. `setup` runs after workspace provision and
 # after a sandbox rehydrate; the rest are referenced by name from check steps.
@@ -172,42 +138,14 @@ kind = "agent"
 skill = "finalize-changelog"
 
 # Runtime, model, and args per phase role. `default` is the inheritance base
-# and is never dispatched as a phase; every other role overrides each field
-# independently, and a declared args list replaces rather than unions.
-# Producers run on Claude Opus because Claude is the larger subscription pool;
-# reviewers run on GPT for model diversity. Each role falls back to the other
-# provider's model when its own is overloaded or out of quota. Every route
-# names its billing account explicitly: Codex on the ChatGPT subscription,
-# Claude Code on the Claude subscription.
+# and is never dispatched as a phase; every role that declares no table of its
+# own inherits it. This fork runs every role on Claude Code against the one
+# Claude subscription, falling back to Sonnet when Opus is overloaded.
 [roles.default]
-runtime = "codex"
-model = "gpt-6.1-sol"
-account = "chatgpt"
-alternates = [{ runtime = "claude", model = "claude-opus-5-5", account = "claude" }]
-
-[roles.plan]
 runtime = "claude"
 model = "claude-opus-5-5"
 account = "claude"
-alternates = [{ runtime = "codex", model = "gpt-6.1-sol", account = "chatgpt" }]
-
-[roles.implement]
-runtime = "claude"
-model = "claude-opus-5-5"
-account = "claude"
-alternates = [{ runtime = "codex", model = "gpt-6.1-sol", account = "chatgpt" }]
-
-[roles.plan-review]
-runtime = "codex"
-model = "gpt-6.1-sol"
-account = "chatgpt"
-alternates = [{ runtime = "claude", model = "claude-opus-5-5", account = "claude" }]
-
-[roles.code-review]
-runtime = "codex"
-model = "gpt-6.1-sol"
-account = "chatgpt"
-alternates = [{ runtime = "claude", model = "claude-opus-5-5", account = "claude" }]
+alternates = [{ runtime = "claude", model = "claude-sonnet-5-5", account = "claude" }]
 
 [policy]
 stallRounds = 3          # a finding surviving N review rounds escalates
@@ -227,18 +165,14 @@ harvestThreshold = 5     # queued observations that trigger a harvest on back-pr
 from = "node"
 mode = "auto"
 
-# Ticket source and lifecycle states. Tickets live in the hosted service at
-# app.autobuild.run, so this repository dogfoods it (since 2026-10-27). Before
-# that they were local files: this repository moved off Linear on 2026-10-21
-# because the dispatcher kept exhausting Linear's hourly request budget. AUT-n
-# ids were kept through both moves.
+# Ticket source and lifecycle states. This fork files tickets as GitHub issues
+# on yosefAlsuhaibani/autobuild (the `origin` remote); upstream uses the hosted
+# service at app.autobuild.run with AUT-n ids.
 [tickets]
-source = "hosted"
-url = "https://app.autobuild.run"
-teamKey = "AUT"
+source = "github"
 readyState = "ready"            # sole ready gate
 readyLabels = []                # additional label gate ([] = none)
-createState = "ready"           # new tickets are filed straight to ready, as before the move
+createState = "triage"          # new tickets wait for a human to groom them to ready
 triageState = "triage"          # bounced, aborted, and closed-unmerged tickets return here
 proposalState = "triage"        # harvest proposals wait for a human to groom them to ready.
                                 # Auto-dispatching them (proposalState = readyState) ran away:
@@ -246,5 +180,7 @@ proposalState = "triage"        # harvest proposals wait for a human to groom th
 backlogState = "icebox"         # deferred on purpose; `--role backlog` moves here
 rejectedState = "rejected"      # considered and declined; `--role rejected` moves here
 
+# This fork's own hosted service: Vercel project yosef-d7ab/yosef-autobuild,
+# deployed from this fork's main (store only, no dispatcher cron).
 [store]
-url = "https://app.autobuild.run"
+url = "https://yosef-autobuild.vercel.app"
