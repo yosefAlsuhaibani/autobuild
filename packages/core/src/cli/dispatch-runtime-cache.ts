@@ -461,7 +461,7 @@ export async function prepareRuntime(
   guest: {
     provenance: 'source' | 'registry'
   } = { provenance: 'source' },
-  options: { mkdtemp?: typeof mkdtemp } = {},
+  options: { mkdtemp?: (prefix: string) => Promise<string> } = {},
 ): Promise<CachedRuntime> {
   source = await realpath(source)
   checkout = await realpath(checkout)
