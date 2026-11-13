@@ -1162,8 +1162,10 @@ effective-config changes and bounded enrichment refreshes while retaining the
 cached log and reduction. `repository-poll.ts` serializes the complete presentation
 snapshot in both terminal paths. It samples `getRepoChangePosition` before reads,
 acknowledges it only after complete admitted reads, and reuses unchanged snapshots
-for up to ten seconds. Scoped discovery uses `listBuildsForRepo`; unchanged focused
-frames make one counter request. Session feeds remain independent.
+for up to ten seconds. Scoped discovery uses `listBuildsForRepo`; a cache's first
+refresh classifies completed builds from one `getRepoBuildDigests` read, so a
+fresh frame reads values only for builds that are not done, concurrently.
+Unchanged focused frames make one counter request. Session feeds remain independent.
 
 The memory adapter maintains independent bigint counters; SQLite and PostgreSQL
 increment `repo_change_positions` transactionally through triggers on build,
