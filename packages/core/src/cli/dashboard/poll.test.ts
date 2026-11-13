@@ -8,7 +8,14 @@ import {
 import { reduceBuild } from '../../kernel/reducer'
 import { steppingClock } from '../../testing/fixed'
 import { MemoryBuildStore } from '../../store/memory'
-import type { BuildRecord } from '../../store/types'
+import type {
+  Artifact,
+  BuildDigest,
+  BuildRecord,
+  BuildStore,
+  StreamRecord,
+  StreamScope,
+} from '../../store/types'
 import { DashboardBuildPollCache, type DashboardBuildReader } from './poll'
 import { projectBuild } from './model'
 
@@ -678,3 +685,209 @@ test('persisted dashboard facts render large builds without raw history on cold 
   await cache.refresh()
   expect(reads).toBe(3)
 })
+
+/** A reader with the full presentation surface over a memory store. `path`
+ * selects reduced values or the raw event path; `digests` toggles the
+ * repository digest batch, so a reader without it is the reference behaviour. */
+class PresentationReader implements DashboardBuildReader {
+  /** The slug of every build-scoped facts or events read, in issue order. */
+  reads: string[] = []
+  digestReads = 0
+  failNextDigest = false
+  transformDigests: ((digests: Map<string, BuildDigest>) => void) | undefined
+  getReducerValue?: BuildStore['getReducerValue']
+  getRepoBuildDigests?: BuildStore['getRepoBuildDigests']
+
+  constructor(
+    private readonly store: MemoryBuildStore,
+    private readonly path: 'reduced' | 'events',
+    digests: boolean,
+  ) {
+    if (path === 'reduced')
+      this.getReducerValue = async (scope, request) => {
+        if (scope.kind === 'build') this.reads.push(scope.slug)
+        return store.getReducerValue(scope, request)
+      }
+    if (digests)
+      this.getRepoBuildDigests = async (repo) => {
+        this.digestReads += 1
+        if (this.failNextDigest) {
+          this.failNextDigest = false
+          throw new Error('scripted digest failure')
+        }
+        const batch = new Map(await store.getRepoBuildDigests(repo))
+        this.transformDigests?.(batch)
+        return batch
+      }
+  }
+
+  listBuildsForRepo(repo: string): Promise<BuildRecord[]> {
+    return this.store.listBuildsForRepo(repo)
+  }
+
+  async getEvents(slug: string, sinceSeq = 0): ReturnType<MemoryBuildStore['getEvents']> {
+    if (this.path === 'reduced') throw new Error('dashboard must not request raw history')
+    this.reads.push(slug)
+    return this.store.getEvents(slug, sinceSeq)
+  }
+
+  listStreams(scope: StreamScope): Promise<StreamRecord[]> {
+    return this.store.listStreams(scope)
+  }
+
+  getArtifact(slug: string, kind: string, rev?: number): Promise<Artifact | null> {
+    return this.store.getArtifact(slug, kind, rev)
+  }
+
+  /** The sorted, de-duplicated slugs read since the last call. */
+  takeReads(): string[] {
+    const reads = [...new Set(this.reads)].sort()
+    this.reads = []
+    return reads
+  }
+}
+
+const LIVE = ['blocked', 'cleaning', 'running']
+
+/** Twelve builds the reducer considers done (half of them aborted first), a
+ * running build, a blocked one, and an aborted one still cleaning up. */
+async function addHistory(store: MemoryBuildStore): Promise<void> {
+  for (let index = 0; index < 6; index += 1) {
+    await addTerminal(store, `done-${index}`, 'done')
+    await addTerminal(store, `abandoned-${index}`, 'aborted')
+  }
+  await addRunning(store, 'running')
+  await addRunning(store, 'blocked')
+  await store.append('blocked', { actor: KERNEL, type: 'plan.started', payload: { round: 1 } })
+  await store.append('blocked', {
+    actor: KERNEL,
+    type: 'escalation.raised',
+    payload: {
+      id: 'esc-history',
+      phase: 'plan',
+      round: 1,
+      source: 'policy',
+      policyCause: 'phase-attempt-limit',
+      question: 'Which history should be shown?',
+    },
+  })
+  await addRunning(store, 'cleaning')
+  await store.append('cleaning', { actor: KERNEL, type: 'build.aborted', payload: {} })
+}
+
+type Snapshot = Awaited<ReturnType<DashboardBuildPollCache['refresh']>>
+
+function expectSameSnapshot(actual: Snapshot, reference: Snapshot): void {
+  expect(actual.builds).toEqual(reference.builds)
+  expect([...actual.states]).toEqual([...reference.states])
+  expect(actual.capacityBuilds).toEqual(reference.capacityBuilds)
+}
+
+for (const path of ['reduced', 'events'] as const) {
+  describe(`first refresh classifies done builds from digests (${path} path)`, () => {
+    test('a cold refresh reads only builds that are not done and matches the per-build path', async () => {
+      const store = new MemoryBuildStore({ clock: steppingClock() })
+      await addHistory(store)
+      const reader = new PresentationReader(store, path, true)
+      const cold = await new DashboardBuildPollCache(reader, REPO, CONFIG).refresh()
+
+      expect(reader.digestReads).toBe(1)
+      expect(reader.takeReads()).toEqual(LIVE)
+      // An abort whose cleanup has not completed is shown exactly as before.
+      expect(row(cold, 'cleaning')?.status).toBe('cleaning')
+      expect(cold.states.get('cleaning')?.status).toBe('aborted')
+      expect(row(cold, 'blocked')?.status).toBe('blocked')
+
+      const reference = new PresentationReader(store, path, false)
+      const expected = await new DashboardBuildPollCache(reference, REPO, CONFIG).refresh()
+      expect(reference.takeReads()).toHaveLength(15)
+      expectSameSnapshot(cold, expected)
+      await store.close()
+    })
+
+    test('later refreshes never read digests; new and finishing builds behave as before', async () => {
+      const store = new MemoryBuildStore({ clock: steppingClock() })
+      await addHistory(store)
+      const reader = new PresentationReader(store, path, true)
+      const reference = new PresentationReader(store, path, false)
+      const cache = new DashboardBuildPollCache(reader, REPO, CONFIG)
+      const referenceCache = new DashboardBuildPollCache(reference, REPO, CONFIG)
+      const step = async () => {
+        const snapshot = await cache.refresh()
+        expectSameSnapshot(snapshot, await referenceCache.refresh())
+        return snapshot
+      }
+      await step()
+      reader.takeReads()
+
+      await store.append('running', { actor: KERNEL, type: 'plan.started', payload: { round: 1 } })
+      await addRunning(store, 'late')
+      expect(row(await step(), 'late')).toBeDefined()
+      expect(reader.digestReads).toBe(1)
+      expect(reader.takeReads()).toEqual([...LIVE, 'late'].sort())
+
+      await store.append('running', {
+        actor: { kind: 'dispatcher' },
+        type: 'build.completed',
+        payload: { outcome: 'merged' },
+      })
+      const finished = await step()
+      expect(reader.takeReads()).toEqual(['blocked', 'cleaning', 'late', 'running'])
+      expect(row(finished, 'running')).toBeUndefined()
+      expect(finished.states.has('running')).toBe(false)
+
+      await step()
+      expect(reader.takeReads()).toEqual(['blocked', 'cleaning', 'late'])
+      expect(reader.digestReads).toBe(1)
+      await store.close()
+    })
+
+    test('a missing or not-done digest falls back to the build’s own facts', async () => {
+      const store = new MemoryBuildStore({ clock: steppingClock() })
+      await addHistory(store)
+      const reader = new PresentationReader(store, path, true)
+      reader.transformDigests = (digests) => {
+        digests.delete('done-0')
+        const { terminal: _terminal, ...unfinished } = digests.get('done-1')!
+        digests.set('done-1', unfinished)
+        digests.set('done-2', { ...digests.get('done-2')!, terminal: 'aborted' })
+      }
+      const cache = new DashboardBuildPollCache(reader, REPO, CONFIG)
+      const cold = await cache.refresh()
+      expect(reader.takeReads()).toEqual([...LIVE, 'done-0', 'done-1', 'done-2'].sort())
+      // Their own facts say done, so they are tombstoned like any done build.
+      for (const slug of ['done-0', 'done-1', 'done-2']) {
+        expect(row(cold, slug)).toBeUndefined()
+        expect(cold.states.has(slug)).toBe(false)
+      }
+
+      await store.append('running', { actor: KERNEL, type: 'plan.started', payload: { round: 1 } })
+      await cache.refresh()
+      expect(reader.takeReads()).toEqual(LIVE)
+      expect(reader.digestReads).toBe(1)
+      await store.close()
+    })
+
+    test('a failed digest read fails the refresh uncommitted and the next refresh retries it', async () => {
+      const store = new MemoryBuildStore({ clock: steppingClock() })
+      await addHistory(store)
+      const reader = new PresentationReader(store, path, true)
+      const cache = new DashboardBuildPollCache(reader, REPO, CONFIG)
+      reader.failNextDigest = true
+      await expect(cache.refresh()).rejects.toThrow('scripted digest failure')
+      // The failure never degrades to one read per historical build.
+      expect(reader.takeReads()).toEqual([])
+
+      const recovered = await cache.refresh()
+      expect(recovered.revision).toBe(1)
+      expect(reader.digestReads).toBe(2)
+      expect(reader.takeReads()).toEqual(LIVE)
+      const reference = new PresentationReader(store, path, false)
+      expectSameSnapshot(
+        recovered,
+        await new DashboardBuildPollCache(reference, REPO, CONFIG).refresh(),
+      )
+      await store.close()
+    })
+  })
+}

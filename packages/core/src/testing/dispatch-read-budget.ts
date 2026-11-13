@@ -4,10 +4,10 @@ import { READ_CATALOG_IDENTITY } from '../events/compatibility'
 import { dispatchFrontendReducer } from '../cli/dispatch-repository-feed'
 import { catalogSnapshotName, loadReducerSnapshot } from '../store/snapshots'
 import { expect } from 'bun:test'
-import { DispatchFrontend } from '../cli/dispatch-frontend'
+import { DispatchFrontend, type DispatchFrontendOptions } from '../cli/dispatch-frontend'
 import type { DispatchChildResult } from '../cli/dispatch-process'
 import { createTerminalModeController } from '../cli/terminal-restore'
-import { DISPATCHER, humanActor } from '../events/envelope'
+import { DISPATCHER, KERNEL, humanActor } from '../events/envelope'
 import type { BuildStore } from '../store/types'
 import type { RepositoryEvent } from '../events/repository'
 import type { DashboardModel } from '../cli/dashboard/model'
@@ -55,6 +55,7 @@ export async function dispatchReadBudget(
 ): Promise<void> {
   await warmRestoreReadBudget(store, backing, true, fillDiscarded)
   await viewerReadBudget(store, backing)
+  await coldDashboardReadBudget(store, backing)
   const repo = '/dashboard-read-budget'
   await backing.ensureRepo(repo)
   const metrics = {
@@ -697,6 +698,299 @@ async function viewerReadBudget(store: BuildStore, backing: BuildStore): Promise
     backing.getRepoEvents = originalEvents
     backing.getRepoStateEvents = originalSeed
   }
+}
+
+/** The build a store call names: a slug string, or a build scope (`slug` for
+ * reducer values, `build` for streams). Repository-scoped calls name none. */
+function buildArgument(argument: unknown): string | undefined {
+  if (typeof argument === 'string') return argument
+  if (typeof argument !== 'object' || argument === null) return undefined
+  const scope = argument as { kind?: unknown; slug?: unknown; build?: unknown }
+  if (scope.kind !== 'build') return undefined
+  const slug = scope.slug ?? scope.build
+  return typeof slug === 'string' ? slug : undefined
+}
+
+/** Private frontend seams the harness drives instead of wall-clock timers. */
+function frontendInternals(frontend: DispatchFrontend) {
+  return frontend as unknown as {
+    renderOnce(): Promise<void>
+    model?: DashboardModel
+    refresh?: { flight?: Promise<void> }
+  }
+}
+
+/** Request a frame, then wait out every in-flight refresh, including a wakeup
+ * one schedules for itself. */
+async function renderSettled(frontend: DispatchFrontend, request = true): Promise<void> {
+  const internals = frontendInternals(frontend)
+  if (request) await internals.renderOnce()
+  for (let flight = internals.refresh?.flight; flight !== undefined; ) {
+    await flight
+    flight = internals.refresh?.flight
+  }
+}
+
+/** A fresh dashboard reads per-build values only for builds that are not done.
+ * The `--once` frame, the interactive owner and the viewer each cold-start
+ * beside the same three live builds and 10, then 1,000, finished ones, and
+ * must issue identical build-scoped reads at both sizes. Fixtures are written
+ * through `backing`; each cold start counts calls into its own facade over
+ * `store`, so the remote run measures client requests, not the server's
+ * per-build digest values. */
+async function coldDashboardReadBudget(store: BuildStore, backing: BuildStore): Promise<void> {
+  type Tally = Record<string, number>
+  type Mode = 'once' | 'owner' | 'viewer'
+  const tallies: Record<Mode, Tally[][]> = { once: [], owner: [], viewer: [] }
+  const config = JSON.stringify({
+    capacity: 4,
+    roles: { default: { runtime: 'claude' } },
+    tickets: { source: 'file', readyState: 'ready' },
+  })
+  const terminal = (interactive: boolean) => ({
+    columns: 100,
+    rows: 24,
+    interactive,
+    write: () => {},
+    modes: createTerminalModeController(
+      () => {},
+      () => {},
+    ),
+  })
+  const scheduler = { now: () => 0, set: () => undefined, clear: () => {} }
+  for (const finished of [10, 1000]) {
+    // Slugs are global store keys, so each size has its own.
+    const repo = `/cold-dashboard-${finished}`
+    const prefix = `cold-${finished}-`
+    const live = ['blocked', 'cleaning', 'running'].map((name) => `${prefix}${name}`)
+    const [blocked, cleaning] = live as [string, string, string]
+    await backing.ensureRepo(repo)
+    for (const slug of live) {
+      await backing.createBuild({ slug, repo })
+      await backing.append(slug, {
+        actor: KERNEL,
+        type: 'runner.attached',
+        payload: { instance: `runner-${slug}`, host: 'budget' },
+      })
+    }
+    await backing.append(blocked, { actor: KERNEL, type: 'plan.started', payload: { round: 1 } })
+    await backing.append(blocked, {
+      actor: KERNEL,
+      type: 'escalation.raised',
+      payload: {
+        id: `esc-${blocked}`,
+        phase: 'plan',
+        round: 1,
+        source: 'policy',
+        policyCause: 'phase-attempt-limit',
+        question: 'Which history should a cold dashboard read?',
+      },
+    })
+    // Acknowledged but not completed: still shown, still read.
+    await backing.append(cleaning, { actor: KERNEL, type: 'build.aborted', payload: {} })
+    for (let index = 0; index < finished; index++) {
+      const slug = `${prefix}done-${index}`
+      await backing.createBuild({ slug, repo })
+      if (index % 5 === 0)
+        await backing.append(slug, { actor: KERNEL, type: 'build.aborted', payload: {} })
+      await backing.append(slug, {
+        actor: DISPATCHER,
+        type: 'build.completed',
+        payload: { outcome: index % 5 === 0 ? 'abandoned' : 'merged' },
+      })
+    }
+    const startRun = (run: string) =>
+      backing.appendRepoWithArtifacts(repo, [{ kind: 'config', content: config }], (artifacts) => ({
+        actor: DISPATCHER,
+        type: 'dispatcher.run-started',
+        payload: {
+          run,
+          pid: 1,
+          roleWarnings: [],
+          effectiveConfig: { kind: artifacts[0]!.kind, rev: artifacts[0]!.revision },
+        },
+      }))
+    const stopRun = (run: string) =>
+      backing.appendRepo(repo, {
+        actor: DISPATCHER,
+        type: 'dispatcher.run-stopped',
+        payload: { run, outcome: 'normal' },
+      })
+
+    /** One cold start: a new frontend over a new counting facade. */
+    const coldStart = (
+      options: Omit<DispatchFrontendOptions, 'repo' | 'store' | 'storeRef' | 'env' | 'clock'>,
+    ) => {
+      const calls: Tally = {}
+      const slugs = new Set<string>()
+      let digests = 0
+      const facade = new Proxy(store, {
+        get(target, key) {
+          const value = Reflect.get(target, key, target)
+          if (typeof value !== 'function') return value
+          // Bound to the target, so adapter-internal calls (such as the
+          // memory adapter's own per-build digest values) are not counted.
+          return (...args: unknown[]) => {
+            if (key === 'getRepoBuildDigests') digests++
+            const slug = buildArgument(args[0])
+            if (slug?.startsWith(prefix)) {
+              calls[String(key)] = (calls[String(key)] ?? 0) + 1
+              slugs.add(slug)
+            }
+            return value.apply(target, args)
+          }
+        },
+      })
+      const frontend = new DispatchFrontend({
+        ...options,
+        repo,
+        store: facade,
+        storeRef: 'budget',
+        env: {},
+        clock: () => new Date(0),
+      })
+      /** The build-scoped tally so far. One digest read classified history,
+       * and only live builds were ever read, never through raw events. */
+      const measure = (): Tally => {
+        expect(digests).toBe(1)
+        expect([...slugs].filter((slug) => !live.includes(slug))).toEqual([])
+        expect(calls.getEvents).toBeUndefined()
+        return { ...calls }
+      }
+      /** The first painted frame shows exactly the live rows, and it read each
+       * of them: a facade that silently counted nothing cannot pass. */
+      const expectFirstFrame = () => {
+        const model = frontendInternals(frontend).model
+        const rows = new Map(model?.builds.map((build) => [build.slug, build.status]))
+        expect([...rows.keys()].sort()).toEqual(live)
+        expect(rows.get(blocked)).toBe('blocked')
+        expect(rows.get(cleaning)).toBe('cleaning')
+        expect([...slugs].sort()).toEqual(live)
+        return measure()
+      }
+      /** After the cold frame, an unchanged position reads nothing; a changed
+       * one reads only the live builds again, with no second digest read. */
+      const expectLaterFrames = async (cold: Tally): Promise<Tally> => {
+        await renderSettled(frontend)
+        expect(measure()).toEqual(cold)
+        await backing.appendRepo(repo, {
+          actor: humanActor('budget'),
+          type: 'dispatcher.pause-set',
+          payload: { enabled: false },
+        })
+        await renderSettled(frontend)
+        const changed: Tally = {}
+        for (const [method, count] of Object.entries(measure()))
+          if (count > (cold[method] ?? 0)) changed[method] = count - (cold[method] ?? 0)
+        expect(Object.keys(changed).length).toBeGreaterThan(0)
+        return changed
+      }
+      return { frontend, expectFirstFrame, expectLaterFrames }
+    }
+
+    // `ab dispatch --once` on an interactive terminal paints one frame after
+    // its kernel completes.
+    {
+      let run = ''
+      const { frontend, expectFirstFrame } = coldStart({
+        once: true,
+        input: { start: () => () => {} },
+        terminal: terminal(true),
+        launchChild: (launch) => {
+          run = launch.run
+          const completed = startRun(run).then(() => ({ outcome: 'normal', exitCode: 0 }) as const)
+          return { completed, stop: async () => {} }
+        },
+      })
+      await frontend.run()
+      tallies.once.push([expectFirstFrame()])
+      await stopRun(run)
+    }
+
+    // The interactive owning frontend, polled by a scripted scheduler.
+    {
+      let finish!: (result: DispatchChildResult) => void
+      let launched!: () => void
+      const launch = new Promise<void>((resolve) => {
+        launched = resolve
+      })
+      const { frontend, expectFirstFrame, expectLaterFrames } = coldStart({
+        once: false,
+        input: { start: () => () => {} },
+        terminal: terminal(true),
+        refreshScheduler: scheduler,
+        launchChild: () => {
+          launched()
+          return {
+            completed: new Promise<DispatchChildResult>((resolve) => {
+              finish = resolve
+            }),
+            stop: async () => {},
+          }
+        },
+      })
+      // Configure the run before the startup poll samples the change position,
+      // so its frame is recorded at the position it read.
+      const run = (frontend as unknown as { runId: string }).runId
+      await startRun(run)
+      const running = frontend.run()
+      try {
+        // Presentation starts as soon as the child is launched.
+        await launch
+        await renderSettled(frontend, false)
+        const cold = expectFirstFrame()
+        tallies.owner.push([cold, await expectLaterFrames(cold)])
+      } finally {
+        finish({ outcome: 'normal', exitCode: 0 })
+        await running
+        await stopRun(run)
+      }
+    }
+
+    // A viewer of a dispatcher configured elsewhere.
+    await startRun(`elsewhere-${finished}`)
+    {
+      const controller = new AbortController()
+      let outputs = 0
+      let painted!: () => void
+      const firstFrame = new Promise<void>((resolve) => {
+        painted = resolve
+      })
+      const { frontend, expectFirstFrame, expectLaterFrames } = coldStart({
+        viewer: {},
+        once: false,
+        signal: controller.signal,
+        refreshScheduler: scheduler,
+        // The viewer indicator, then its first frame.
+        plainOutput: () => {
+          if (++outputs >= 2) painted()
+        },
+        terminal: terminal(false),
+        input: {
+          start: () => {
+            throw new Error('viewer input')
+          },
+        },
+        launchChild: () => {
+          throw new Error('viewer child')
+        },
+      })
+      const running = frontend.run()
+      try {
+        await firstFrame
+        await renderSettled(frontend, false)
+        const cold = expectFirstFrame()
+        tallies.viewer.push([cold, await expectLaterFrames(cold)])
+      } finally {
+        controller.abort()
+        await running
+      }
+    }
+  }
+  // Every mode and phase reads the same per-build values at 10 and at 1,000
+  // finished builds.
+  for (const [mode, [ten, thousand]] of Object.entries(tallies))
+    expect({ mode, reads: thousand }).toEqual({ mode, reads: ten })
 }
 
 /** Script a minute at both launcher cadences using the real runtime reader and
