@@ -271,7 +271,11 @@ and its already installed production dependency graph into the canonical
 checkout's `.autobuild/runtime/` cache, offline. Source edits (including
 uncommitted edits) and dependency bytes participate in content identity; version
 alone never selects a snapshot. Completed distribution roots are immutable.
-The generation, kernel, later local runners and agent PATH `ab` all execute
+A launch identifies its snapshot from the source tree and installed dependency
+graph before copying anything. When that snapshot is already cached, the launch
+re-verifies the completed entry, its archives and its dependency layer, confirms
+neither input changed during preparation, and reuses the entry without
+assembling a new tree. The generation, kernel, later local runners and agent PATH `ab` all execute
 from that same root. Run/attach runtime identities name the cached directory.
 Source generations capture their guest archive from that exact snapshot.
 Registry generations preserve the normalized host archive and resolve their
@@ -313,8 +317,9 @@ inconsistent metadata is an attention failure. With no declaration (including
 no root manifest), installed mode rereads the original public installation
 pathname retained across handoffs. A launch from a source root in the dispatched
 repository's Git common-directory topology selects source mode instead. That
-eligibility and its initial packaged snapshot are frozen across successors. The
-target is the forge-authoritative base commit, exported into private cache staging
+eligibility and its initial packaged snapshot are frozen across successors. A
+launch remembers packaged fingerprints by exact packaged input bytes and
+packaging toolchain, so an unchanged source is not repacked. The target is the forge-authoritative base commit, exported into private cache staging
 without changing any operator or build worktree. A frozen-lockfile, script-free
 Bun install supplies dependencies; the completed immutable runtime records the
 exact commit and follows ordinary cache retention and pruning. Source adoption
