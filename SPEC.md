@@ -3117,7 +3117,11 @@ Other repositories, failed writes, denied claims, same-holder renewals, heartbea
 and passive expiry do not advance it. It is separate from journal sequence cursors.
 Unchanged positions reuse the complete presentation snapshot; an ordinary refresh, focused or unfocused,
 then makes exactly one store request. Discovery uses required exact-repo
-`listBuildsForRepo(repo)`, never a global listing. Initial hydration, position or
+`listBuildsForRepo(repo)`, never a global listing. A fresh presentation cache's
+first refresh also makes one `getRepoBuildDigests(repo)` read and records each
+build whose digest is `done` without reading it, so a new process reads per-build
+values only for builds that are not done; aborted builds stay visible through
+cleanup. Initial hydration, position or
 configuration changes, and at most ten seconds between full reads refresh the
 snapshot, including mutable lease/stream/artifact/ticket enrichment. Failed or
 cancelled reads do not acknowledge the sampled position. Open session feeds poll
