@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, mkdir, writeFile, readFile, rm, chmod, readdir } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, readFile, rm, chmod, readdir, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -10,6 +10,7 @@ import {
   sourceRepository,
 } from './dispatch-upgrade-source'
 import { scanDependencies, treeDigest } from './dispatch-runtime-dependencies'
+import { readCacheMemo } from './dispatch-runtime-use'
 const roots: string[] = []
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
@@ -195,3 +196,35 @@ test.each(['checkout', 'workspace', 'both'])(
     }
   },
 )
+
+test('remembered packaged fingerprints stand in only for byte-identical packaged inputs', async () => {
+  const root = await fixture()
+  const memo = await mkdtemp(join(tmpdir(), 'ab-source-memo-'))
+  roots.push(memo)
+  const key = async (remembered?: string) =>
+    (await sourceContent(root, '/repository', undefined, remembered)).key
+  const memoFile = join(memo, 'source-fingerprints.json')
+  const k0 = await key()
+  expect(await key(memo)).toBe(k0)
+  expect(readCacheMemo(memo, 'source-fingerprints.json')).toHaveLength(1)
+  // A tampered value is served as-is, which proves the second call never repacked.
+  const recorded = await readFile(memoFile, 'utf8')
+  const entries = JSON.parse(recorded)
+  entries.entries[0].value = 'f'.repeat(64)
+  await writeFile(memoFile, JSON.stringify(entries))
+  expect(await key(memo)).not.toBe(k0)
+  await writeFile(memoFile, recorded)
+  expect(await key(memo)).toBe(k0)
+  // Bytes pack excludes change the input but not the fingerprint.
+  await writeFile(join(root, 'src/main.test.ts'), 'changed test')
+  expect(await key(memo)).toBe(k0)
+  await writeFile(join(root, 'docs/guide.md'), 'changed guide')
+  const changed = await key(memo)
+  expect(changed).not.toBe(k0)
+  expect(changed).toBe(await key())
+  // Inputs a plain walk cannot vouch for always repack and are never remembered.
+  const remembered = readCacheMemo(memo, 'source-fingerprints.json').length
+  await symlink('main.ts', join(root, 'src/alias.ts'))
+  expect(await key(memo)).toBe(await key())
+  expect(readCacheMemo(memo, 'source-fingerprints.json')).toHaveLength(remembered)
+})

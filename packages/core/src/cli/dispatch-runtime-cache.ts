@@ -1,8 +1,12 @@
 import { existsSync, renameSync, readFileSync, writeFileSync } from 'node:fs'
 import {
   reservePreparedRuntime,
+  reserveExistingRuntime,
+  releasePreparedRuntime,
   mutateRuntimeCache,
   ownCachedRuntime,
+  readCacheMemo,
+  recordCacheMemo,
 } from './dispatch-runtime-use'
 import {
   cp,
@@ -13,19 +17,22 @@ import {
   readdir,
   rm,
   writeFile,
-  chmod,
   realpath,
 } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { packageDistribution } from '../distribution-packaging'
 import {
+  SnapshotModel,
+  codeIdentity,
   copyDependencies,
   copySnapshotTree,
   excludedSnapshotNames,
+  filesystemWriter,
   inside,
   readManifest,
   scanDependencies,
   treeDigest,
+  type DependencyGraph,
 } from './dispatch-runtime-dependencies'
 
 export const RUNTIME_CONFIG = '{}\n'
@@ -174,7 +181,7 @@ exec bun --no-install --tsconfig-override "$runtime_root/tsconfig.json" "$runtim
 /** Publication, retention and process-use claims share this short lock. */
 export const withCacheLock = mutateRuntimeCache
 
-async function stageCode(source: string, target: string): Promise<void> {
+async function stageCode(source: string, target: string, writer = filesystemWriter): Promise<void> {
   const manifest = await readManifest(source)
   let bunTag: string | undefined
   try {
@@ -189,16 +196,23 @@ async function stageCode(source: string, target: string): Promise<void> {
   }
   if (!Array.isArray(manifest.files))
     throw new Error('Autobuild manifest must declare distribution files')
-  await mkdir(target, { recursive: true })
+  await writer.mkdir(target)
   for (const entry of manifest.files) {
     if (entry.startsWith('!') || entry === 'tsconfig.json') continue
     if (!inside(source, resolve(source, entry)) || excludedSnapshotNames.has(entry))
       throw new Error(`unsafe distribution path: ${entry}`)
-    await copySnapshotTree(join(source, entry), join(target, entry), source)
+    await copySnapshotTree(
+      join(source, entry),
+      join(target, entry),
+      source,
+      undefined,
+      undefined,
+      writer,
+    )
   }
   // Preserve Bun's forge provenance even when the tag only contains an abbreviated SHA.
   if (bunTag) {
-    await writeFile(join(target, '.bun-tag'), bunTag)
+    await writer.writeFile(join(target, '.bun-tag'), bunTag)
     if (!manifest.files.includes('.bun-tag')) manifest.files.push('.bun-tag')
   }
   delete manifest.devDependencies
@@ -225,11 +239,21 @@ async function stageCode(source: string, target: string): Promise<void> {
     /* Package provenance may be unknown without Git. */
   }
   manifest.files = [...manifest.files.filter((p) => p !== 'tsconfig.json'), 'tsconfig.json']
-  await writeFile(join(target, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`)
-  await writeFile(join(target, 'tsconfig.json'), RUNTIME_CONFIG)
-  await writeFile(join(target, 'bin/agent/ab'), cachedAgentTrampoline)
-  await chmod(join(target, 'bin/agent/ab'), 0o755)
+  await writer.writeFile(join(target, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+  await writer.writeFile(join(target, 'tsconfig.json'), RUNTIME_CONFIG)
+  await writer.writeFile(join(target, 'bin/agent/ab'), cachedAgentTrampoline)
+  await writer.chmod(join(target, 'bin/agent/ab'), 0o755)
 }
+/** Identity of the code tree `stageCode` would write for `source` (a realpath),
+ * computed by running the same staging against an in-memory model. */
+export async function describeRuntimeCode(source: string): Promise<string> {
+  const root = '/autobuild-runtime-model/distribution'
+  const model = new SnapshotModel(root)
+  await stageCode(source, root, model)
+  return model.identity()
+}
+/** A cached runtime keeps its dependency layer directly under its root. */
+const runtimeDependencies: ReadonlySet<string> = new Set(['node_modules'])
 export async function guestArchiveProvenance(source: string): Promise<'source' | 'registry'> {
   const cached = await cachedRuntime(source)
   if (cached) {
@@ -346,6 +370,90 @@ function fetchGuestArchive(
   return pending
 }
 
+/** `true` for a valid layer, `false` for one never built; a corrupt layer throws. */
+async function verifyLayer(layer: string): Promise<boolean> {
+  try {
+    const expected = await readFile(join(layer, 'digest'), 'utf8')
+    if ((await readFile(join(layer, 'distribution', 'tsconfig.json'), 'utf8')) !== RUNTIME_CONFIG)
+      throw new Error(`corrupt dependency compiler boundary: ${layer}`)
+    if ((await treeDigest(join(layer, 'distribution'))) !== expected)
+      throw new Error(`corrupt dependency layer: ${layer}`)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    if (existsSync(layer)) throw new Error(`corrupt dependency layer: ${layer}`, { cause: error })
+    return false
+  }
+}
+
+/** Maps a pre-assembly identity to the runtime id it produced. A hint only:
+ * reuse verifies the named entry against the current inputs before selecting it. */
+const RUNTIME_INDEX = 'runtime-index.json'
+const RUNTIME_INDEX_LIMIT = 32
+function runtimeIndexKey(provenance: string, code: string, dependencies: string): string {
+  return new Bun.CryptoHasher('sha256')
+    .update(JSON.stringify(['runtime-index-v1', provenance, code, dependencies]))
+    .digest('hex')
+}
+
+async function assertUnchanged(source: string, graph: DependencyGraph, code: string) {
+  if ((await scanDependencies(source)).fingerprint !== graph.fingerprint)
+    throw new Error('installed dependencies changed while preparing runtime; retry dispatch')
+  if ((await describeRuntimeCode(source)) !== code)
+    throw new Error('Autobuild source changed while preparing runtime; retry dispatch')
+}
+
+/** Select the indexed runtime for these exact inputs without assembling one.
+ * Returns undefined for a miss; throws to refuse a corrupt cache. */
+async function reuseIndexedRuntime(
+  cache: string,
+  key: string,
+  source: string,
+  checkout: string,
+  graph: DependencyGraph,
+  code: string,
+  provenance: 'source' | 'registry',
+): Promise<CachedRuntime | undefined> {
+  const id = readCacheMemo(cache, RUNTIME_INDEX).find((entry) => entry.key === key)?.value
+  if (!id || !/^\w[\w.-]*-[a-f0-9]{64}$/.test(id)) return undefined
+  const root = join(cache, id, 'distribution')
+  const runtime = await cachedRuntime(root)
+  if (
+    !runtime ||
+    runtime.dependencies !== graph.fingerprint ||
+    runtime.guestArchive?.provenance !== provenance
+  )
+    return undefined
+  // Atomic with pruning: an entry pruned since the lookup is a miss, not corruption.
+  if (!reserveExistingRuntime(root)) return undefined
+  let probe: Promise<void> | undefined
+  try {
+    await validateRuntime(runtime)
+    // The cached tree's own code must equal what the source would stage now.
+    if ((await codeIdentity(root, runtimeDependencies)) !== code) {
+      releasePreparedRuntime(root)
+      return undefined
+    }
+    await validateEntries(root)
+    await validateCoreConfigs(root)
+    probe = validateRuntimeImports(root, checkout)
+    // A corrupt layer is refused; an absent one is fine and is not rebuilt here.
+    await verifyLayer(join(cache, 'layers', graph.fingerprint))
+    await probe
+    await assertUnchanged(source, graph, code)
+    recordCacheMemo(cache, RUNTIME_INDEX, { key, value: id }, RUNTIME_INDEX_LIMIT)
+    return runtime
+  } catch (error) {
+    await probe?.catch(() => {})
+    try {
+      releasePreparedRuntime(root)
+    } catch {
+      /* The refusal below is the failure that matters. */
+    }
+    throw error
+  }
+}
+
 export async function prepareRuntime(
   source: string,
   checkout: string,
@@ -353,35 +461,42 @@ export async function prepareRuntime(
   guest: {
     provenance: 'source' | 'registry'
   } = { provenance: 'source' },
+  options: { mkdtemp?: (prefix: string) => Promise<string> } = {},
 ): Promise<CachedRuntime> {
   source = await realpath(source)
   checkout = await realpath(checkout)
   const cache = join(checkout, '.autobuild', 'runtime')
   await mkdir(cache, { recursive: true })
-  const stage = await mkdtemp(join(cache, '.preparing-'))
+  // Both inputs are known before anything is copied, so a cached runtime for
+  // them is verified and selected without assembling a new tree.
+  const graph = await scanDependencies(source)
+  const code = await describeRuntimeCode(source)
+  const key = runtimeIndexKey(guest.provenance, code, graph.fingerprint)
+  const reused = await reuseIndexedRuntime(
+    cache,
+    key,
+    source,
+    checkout,
+    graph,
+    code,
+    guest.provenance,
+  )
+  if (reused) return reused
+  const stage = await (options.mkdtemp ?? mkdtemp)(join(cache, '.preparing-'))
   const root = join(stage, 'distribution')
   try {
-    const graph = await scanDependencies(source)
     await stageCode(source, root)
-    const codeDigest = await treeDigest(root)
-    const check = join(stage, 'source-check')
-    await stageCode(source, check)
-    if ((await treeDigest(check)) !== codeDigest)
-      throw new Error('Autobuild source changed while preparing runtime; retry dispatch')
-    await rm(check, { recursive: true })
+    if ((await codeIdentity(root)) !== code)
+      throw new Error(
+        (await describeRuntimeCode(source)) !== code
+          ? 'Autobuild source changed while preparing runtime; retry dispatch'
+          : `runtime code model disagrees with the staged runtime: ${source}`,
+      )
     const layers = join(cache, 'layers')
     await mkdir(layers, { recursive: true })
     const layer = join(layers, graph.fingerprint)
     const layerStage = join(stage, 'layer')
-    try {
-      const expected = await readFile(join(layer, 'digest'), 'utf8')
-      if ((await readFile(join(layer, 'distribution', 'tsconfig.json'), 'utf8')) !== RUNTIME_CONFIG)
-        throw new Error(`corrupt dependency compiler boundary: ${layer}`)
-      if ((await treeDigest(join(layer, 'distribution'))) !== expected)
-        throw new Error(`corrupt dependency layer: ${layer}`)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-      if (existsSync(layer)) throw new Error(`corrupt dependency layer: ${layer}`, { cause: error })
+    if (!(await verifyLayer(layer))) {
       await mkdir(join(layerStage, 'distribution'), { recursive: true })
       await copyDependencies(graph, join(layerStage, 'distribution'))
       await writeFile(join(layerStage, 'distribution', 'tsconfig.json'), RUNTIME_CONFIG)
@@ -400,15 +515,10 @@ export async function prepareRuntime(
     })
     await validateEntries(root)
     await validateCoreConfigs(root)
-    if ((await scanDependencies(source)).fingerprint !== graph.fingerprint)
-      throw new Error('installed dependencies changed while preparing runtime; retry dispatch')
-    await stageCode(source, check)
-    if ((await treeDigest(check)) !== codeDigest)
-      throw new Error('Autobuild source changed while preparing runtime; retry dispatch')
-    await rm(check, { recursive: true })
     // Real Bun import graph validation uses the same pre-entry compiler boundary
     // as every generation and runner. No automatic installer can run here.
     await validateRuntimeImports(root, checkout)
+    await assertUnchanged(source, graph, code)
     const digest = await treeDigest(root)
     const manifest = await readManifest(root)
     const id = `${String(manifest.version).replace(/[^\w.-]/g, '_')}-${guest.provenance}-guest1-${digest}`
@@ -417,6 +527,7 @@ export async function prepareRuntime(
     if (reusable) {
       reservePreparedRuntime(cache, id)
       await validateRuntime(reusable)
+      recordCacheMemo(cache, RUNTIME_INDEX, { key, value: id }, RUNTIME_INDEX_LIMIT)
       return reusable
     }
     const archive = await packageDistribution(root)
@@ -468,6 +579,7 @@ export async function prepareRuntime(
     })
     const completed = await cachedRuntime(runtime.root)
     if (!completed) throw new Error(`runtime publication incomplete: ${destination}`)
+    recordCacheMemo(cache, RUNTIME_INDEX, { key, value: id }, RUNTIME_INDEX_LIMIT)
     return completed
   } finally {
     await rm(stage, { recursive: true, force: true })
