@@ -68,12 +68,15 @@ test('early browser exit is reported and reaped before another attempt', async (
   const { mkdtemp, rm } = await import('node:fs/promises')
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')
+  // `false` is /usr/bin/false on macOS and /bin/false on some Linux images.
+  const exitsOne = Bun.which('false')
+  expect(exitsOne).not.toBeNull()
   const profile = await mkdtemp(join(tmpdir(), 'capture-exit-test-'))
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       await expect(
         fullDocumentScreenshot(
-          '/bin/false',
+          exitsOne!,
           'about:blank',
           join(profile, 'out.png'),
           390,

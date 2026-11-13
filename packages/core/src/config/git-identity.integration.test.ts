@@ -35,7 +35,12 @@ async function provisionedIdentity(): Promise<{ name: string; email: string }> {
 
 type ScratchEnv = Record<string, string>
 
-/** Fresh env built from scratch: PATH, an empty HOME, and no git config sources. */
+/**
+ * Fresh env built from scratch: PATH, an empty HOME, and no git config sources.
+ * `user.useConfigOnly` disables git's fallback of synthesizing an identity from
+ * the account name and hostname, which succeeds on hosts whose hostname looks
+ * like a domain (macOS's `*.local`), so a missing identity fails on every host.
+ */
 async function scratchEnv(): Promise<ScratchEnv> {
   const home = await mkdtemp(join(tmpdir(), 'git-identity-home-'))
   tempRoots.push(home)
@@ -44,6 +49,9 @@ async function scratchEnv(): Promise<ScratchEnv> {
     HOME: home,
     GIT_CONFIG_SYSTEM: '/dev/null',
     GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'user.useConfigOnly',
+    GIT_CONFIG_VALUE_0: 'true',
   }
 }
 

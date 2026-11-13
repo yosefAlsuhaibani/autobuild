@@ -147,7 +147,17 @@ test('real launcher returns the PTY to the shell on Ctrl-Z and fg resumes the da
     'forge = "local-git"\n[roles.default]\nruntime = "claude"\n[tickets]\nsource = "file"\ndir = "tickets"\nreadyState = "ready"\n',
   )
   const script = `
-import os, pty, select, sys, time, shlex, signal, termios
+import os, pty, select, sys, time, shlex, signal, subprocess, termios
+proc = os.path.isdir('/proc/self/task')
+def children(parent):
+ if proc:
+  with open('/proc/'+str(parent)+'/task/'+str(parent)+'/children') as f: return [int(p) for p in f.read().split()]
+ found = subprocess.run(['pgrep', '-P', str(parent)], capture_output=True, text=True).stdout
+ return sorted(int(p) for p in found.split())
+def stopped(target):
+ if proc:
+  with open('/proc/'+str(target)+'/stat') as f: return f.read().split(') ')[1][0] == 'T'
+ return subprocess.run(['ps', '-o', 'stat=', '-p', str(target)], capture_output=True, text=True).stdout.strip().startswith('T')
 pid, fd = pty.fork()
 if pid == 0:
  os.chdir(sys.argv[1])
@@ -182,8 +192,6 @@ try:
  os.write(fd, (command+'\\n').encode())
  until(b'\\x1b[?1049h')
  time.sleep(.5)
- def children(parent):
-  with open('/proc/'+str(parent)+'/task/'+str(parent)+'/children') as f: return [int(p) for p in f.read().split()]
  launcher = children(pid)[0]
  generation = children(launcher)[0]
  kernel = children(generation)[0]
@@ -192,7 +200,7 @@ try:
  until(b'SHELL_READY> ', 5)
  assert b'Stopped' in output, output
  mode(False)
- with open('/proc/'+str(kernel)+'/stat') as f: assert f.read().split(') ')[1][0] != 'T'
+ assert not stopped(kernel)
  output = b''
  os.write(fd, b'fg\\n')
  until(b'\\x1b[?1049h', 5)
