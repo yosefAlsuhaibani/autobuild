@@ -13,8 +13,12 @@ export class FakeRefreshScheduler implements RefreshScheduler {
   clear(handle: unknown): void {
     this.tasks.delete(handle as number)
   }
+  /** Drain in-process store work between scripted inputs. In-memory reads
+   * resolve only through microtasks, so the budget must cover a cold start
+   * plus its first frame, whose cache first reads the repository digest batch
+   * before any per-build read. */
   async settle(): Promise<void> {
-    for (let i = 0; i < 100; i++) await Promise.resolve()
+    for (let i = 0; i < 200; i++) await Promise.resolve()
   }
   async advance(duration: number): Promise<void> {
     const end = this.current + duration
