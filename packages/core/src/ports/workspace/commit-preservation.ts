@@ -298,7 +298,8 @@ export async function inspectGitCandidate(input: {
         '-o',
         'pipefail',
         '-c',
-        'base64 -d "$1" | git unpack-objects -q',
+        // Decode from stdin: BSD base64 (macOS) rejects a positional file.
+        'base64 -d < "$1" | git unpack-objects -q',
         'restore-replay',
         path,
       ],

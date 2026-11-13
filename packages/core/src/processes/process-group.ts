@@ -6,8 +6,14 @@ function validateGroupId(groupId: number): void {
   }
 }
 
+/**
+ * ESRCH means no member remains. Darwin also refuses with EPERM once every
+ * remaining member is a zombie awaiting its parent's wait, where Linux still
+ * counts zombies as members; either way nothing signalable is left.
+ */
 function isGone(error: unknown): boolean {
-  return error instanceof Error && 'code' in error && error.code === 'ESRCH'
+  if (!(error instanceof Error) || !('code' in error)) return false
+  return error.code === 'ESRCH' || (process.platform === 'darwin' && error.code === 'EPERM')
 }
 
 /** Probe a POSIX process group without ever falling back to its leader PID. */

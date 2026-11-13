@@ -2659,6 +2659,8 @@ function isMissing(error: unknown): boolean {
  * Inspect a repository-local Store without asking SQLite to open its source
  * files. Bun can create WAL/SHM files even for a read-only connection, so the
  * database and any live sidecars are copied to a disposable directory first.
+ * The copy is opened writable: a WAL-mode file without sidecars needs its
+ * index created, which SQLite on macOS refuses to a read-only connection.
  */
 export async function inspectLocalStoreSnapshot(rootDir: string): Promise<LocalStoreInspection> {
   const databasePath = join(rootDir, 'autobuild.sqlite')
@@ -2684,7 +2686,7 @@ export async function inspectLocalStoreSnapshot(rootDir: string): Promise<LocalS
         if (!isMissing(error)) throw error
       }
     }
-    database = new Database(snapshotPath, { readonly: true })
+    database = new Database(snapshotPath, { readwrite: true })
     const row = database.query('SELECT count(*) AS count FROM builds').get() as {
       count: number
     } | null

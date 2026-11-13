@@ -265,6 +265,7 @@ a.dim {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  container-type: inline-size;
 }
 .seam {
   display: grid;
@@ -272,6 +273,14 @@ a.dim {
   column-gap: 2ch;
   row-gap: 8px;
   align-items: center;
+}
+/* Beside its 28ch caption a seam needs room for its widest chip (an
+   eight-letter word plus padding), which the docs column lacks just above
+   the phone breakpoint; stack it there as phones do. */
+@container (max-width: 43ch) {
+  .seam {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 .chips {
   display: flex;
